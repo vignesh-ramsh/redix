@@ -3,12 +3,13 @@ redix — ARC provider plugin: Redis/Valkey — cache, distributed locks,
 pub/sub, and rate-limit counters ("one dependency, four jobs" per the
 Architecture tech-stack table).
 
-Exports `arc.redix`. Nothing in Phase 1 hard-requires it — not every ARC
-project wants caching/locks/pubsub/rate-limiting, so it stays a plain
-standalone plugin like any other. It only becomes a hard `requires` for
-whoever installs `authn` (Phase 4, token store) — that is a fact about
-authn's manifest, not about redix itself; redix's own manifest never
-changes because of it.
+Exports `arc.redix`. Nothing hard-requires it — not every ARC project wants
+caching/locks/pubsub/rate-limiting, so it stays a plain standalone plugin
+like any other, including for `authn` (Phase 4, docs/arc.MD §3.13): rate
+limiting genuinely upgrades when redix is installed, but account lockout
+is Postgres-backed and works identically without it — redix stays an
+`optional_requires` there too, never a hard dependency. redix's own
+manifest never changes based on what any other plugin decides.
 
 Same lifecycle note as psqldb: register() only constructs the provider;
 `await arc.redix.open()` / `await arc.redix.close()` are the application's
@@ -70,6 +71,26 @@ class RedixProvider:
         """Returns a pubsub object: `await ps.subscribe(channel)`, then
         `async for msg in ps.listen(): ...`"""
         return self._client_or_raise().pubsub()
+
+    # ---- pattern-based bulk delete ---------------------------------------- #
+    async def scan_delete(self, pattern: str) -> int:
+        """Deletes every key matching `pattern` (glob-style, e.g. "cache:*")
+        using SCAN — never KEYS, which blocks the whole server while it
+        walks the entire keyspace in one shot. Generic, not cache-specific:
+        `arc clear-cache` (the kernel's own CLI) is what calls this with a
+        handful of well-known prefixes; this method itself has no opinion
+        about what any prefix means."""
+        client = self._client_or_raise()
+        deleted = 0
+        batch: list[str] = []
+        async for key in client.scan_iter(match=pattern, count=500):
+            batch.append(key)
+            if len(batch) >= 500:
+                deleted += await client.delete(*batch)
+                batch.clear()
+        if batch:
+            deleted += await client.delete(*batch)
+        return deleted
 
     # ---- rate limiting (fixed window) ------------------------------------ #
     async def rate_limit(self, key: str, limit: int, window_seconds: int) -> bool:
