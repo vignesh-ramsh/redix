@@ -67,10 +67,15 @@ class RedixProvider:
     async def publish(self, channel: str, message: Any) -> None:
         await self._client_or_raise().publish(channel, message)
 
-    def subscribe(self, channel: str):
-        """Returns a pubsub object: `await ps.subscribe(channel)`, then
-        `async for msg in ps.listen(): ...`"""
-        return self._client_or_raise().pubsub()
+    async def subscribe(self, channel: str):
+        """Returns a pubsub object already subscribed to `channel`:
+        `ps = await arc.redix.subscribe("events")`, then
+        `async for msg in ps.listen(): ...`. (Previously returned an
+        UNsubscribed pubsub and silently ignored `channel` — every caller
+        had to subscribe again themselves, or got nothing.)"""
+        ps = self._client_or_raise().pubsub()
+        await ps.subscribe(channel)
+        return ps
 
     # ---- pattern-based bulk delete ---------------------------------------- #
     async def scan_delete(self, pattern: str) -> int:
@@ -93,14 +98,27 @@ class RedixProvider:
         return deleted
 
     # ---- rate limiting (fixed window) ------------------------------------ #
+    # INCR + EXPIRE as ONE atomic Lua script — the two-step version had a
+    # real failure mode: a crash (or dropped connection) between INCR and
+    # EXPIRE left the counter with NO TTL, permanently rate-limiting that
+    # key once it crossed the limit (and `arc clear-cache` deliberately
+    # never touches ratelimit:* keys, so there was no recovery path short
+    # of a manual DEL). EXPIRE also refreshes only when the counter is
+    # fresh, preserving the fixed-window semantics exactly.
+    _RATE_LIMIT_LUA = """
+    local current = redis.call('INCR', KEYS[1])
+    if current == 1 then
+        redis.call('EXPIRE', KEYS[1], ARGV[1])
+    end
+    return current
+    """
+
     async def rate_limit(self, key: str, limit: int, window_seconds: int) -> bool:
         """Returns True if this call is within the limit for the window."""
         client = self._client_or_raise()
         counter_key = f"ratelimit:{key}"
-        current = await client.incr(counter_key)
-        if current == 1:
-            await client.expire(counter_key, window_seconds)
-        return current <= limit
+        current = await client.eval(self._RATE_LIMIT_LUA, 1, counter_key, window_seconds)
+        return int(current) <= limit
 
     async def health(self) -> dict:
         try:
