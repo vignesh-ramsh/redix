@@ -18,12 +18,18 @@ job at startup/shutdown until a real lifecycle hook design exists.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 from typing import Any
 
 import redis.asyncio as redis
+from redis.exceptions import LockError
 
 CAPABILITY = "redix"
 URL_KEY = "redix_url"
+
+_logger = logging.getLogger("redix")
 
 
 class RedixProvider:
@@ -59,9 +65,31 @@ class RedixProvider:
         await self._client_or_raise().delete(key)
 
     # ---- distributed lock ---------------------------------------------- #
-    def lock(self, name: str, timeout: float = 10.0):
-        """`async with arc.redix.lock("job:123"):` ..."""
-        return self._client_or_raise().lock(name, timeout=timeout)
+    def lock(self, name: str, timeout: float = 10.0, *, renew_interval: float | None = None):
+        """`async with arc.redix.lock("job:123") as fencing_token:` — a
+        distributed lock that renews itself in the background for as long
+        as it's held (so a critical section that happens to run longer
+        than `timeout` doesn't silently lose the lock out from under it —
+        the single biggest footgun with a plain TTL-based lock), and hands
+        back a fencing token: an integer that only ever goes up, once per
+        successful acquire of THIS name, forever (Kleppmann's "How to do
+        distributed locking" — the fencing-tokens pattern). Pass it to
+        whatever you're protecting (a write to psqldb, a call to some other
+        service) so that side can reject any write carrying a token lower
+        than the highest one it has already seen — the one thing renewal
+        can reduce the odds of but can never fully rule out (a long GC/
+        scheduler pause between acquiring and your first write can still
+        let the TTL lapse before the first renewal even runs).
+
+        Single Redis instance/primary only — this is a SET NX PX lock plus
+        a best-effort background heartbeat, not Redlock's multi-node
+        quorum. Good enough for "only one of my N workers does this job
+        right now"; not a substitute for a real consensus system if you
+        need correctness under a Redis primary failover.
+        """
+        return _RenewingLock(
+            self._client_or_raise(), name, timeout=timeout, renew_interval=renew_interval
+        )
 
     # ---- pub/sub -------------------------------------------------------- #
     async def publish(self, channel: str, message: Any) -> None:
@@ -128,14 +156,84 @@ class RedixProvider:
             return {"ok": False, "error": str(exc)}
 
 
+class _RenewingLock:
+    """`async with` wrapper around a redis-py Lock: acquires it, hands back
+    a fencing token, keeps the TTL alive with a background heartbeat for as
+    long as the `async with` block runs, and always cancels the heartbeat
+    and releases on exit — even if the block raised. See
+    RedixProvider.lock()'s own docstring for the full design rationale.
+    """
+
+    def __init__(
+        self,
+        client: redis.Redis,
+        name: str,
+        *,
+        timeout: float,
+        renew_interval: float | None,
+    ) -> None:
+        self._name = name
+        self._timeout = timeout
+        # A third of the TTL by default — the same margin Redlock's own
+        # writeup uses: enough headroom that one slow/dropped renewal
+        # doesn't cost the lock outright, without renewing so often it
+        # meaningfully adds load.
+        self._renew_interval = renew_interval if renew_interval is not None else timeout / 3
+        self._lock = client.lock(name, timeout=timeout)
+        self._client = client
+        self._renew_task: asyncio.Task[None] | None = None
+        self.fencing_token: int | None = None
+
+    async def __aenter__(self) -> int:
+        await self._lock.acquire()
+        # A separate, TTL-less counter key — deliberately never expires,
+        # so the sequence keeps climbing across every future acquire of
+        # this same name forever. If this counter itself expired and reset
+        # to 0, a new holder could hand out a LOWER token than one a
+        # previous (possibly still-zombie) holder already has, defeating
+        # the entire point of a fencing token.
+        self.fencing_token = int(await self._client.incr(f"{self._name}:fencing"))
+        self._renew_task = asyncio.create_task(self._renew_loop())
+        return self.fencing_token
+
+    async def _renew_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._renew_interval)
+                try:
+                    await self._lock.extend(self._timeout, replace_ttl=True)
+                except LockError:
+                    # We no longer hold it — someone else's TTL is running
+                    # now. Nothing to do here: the fencing token already
+                    # handed to the caller is exactly what protects
+                    # whatever they're doing from this moment on, not this
+                    # loop. Stop trying rather than spin forever.
+                    _logger.warning(
+                        "redix lock '%s': lost during renewal — the critical "
+                        "section is no longer protected; relying on its "
+                        "fencing token to reject any now-stale writes.",
+                        self._name,
+                    )
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        if self._renew_task is not None:
+            self._renew_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._renew_task
+        with contextlib.suppress(LockError):
+            await self._lock.release()
+
+
 def register(kernel: Any) -> None:
     kernel.settings.declare(URL_KEY, secret=True)
 
     url = kernel.settings.get(URL_KEY, reveal=True)
     if url is None:
         raise RuntimeError(
-            f"'{URL_KEY}' is not set. Run: "
-            f"arc settings set {URL_KEY} redis://host:6379/0 --secret"
+            f"'{URL_KEY}' is not set. Run: arc settings set {URL_KEY} redis://host:6379/0 --secret"
         )
 
     provider = RedixProvider(url)

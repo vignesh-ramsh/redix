@@ -39,8 +39,7 @@ def _url() -> str:
     url = mgr.get(URL_KEY, reveal=True)
     if url is None:
         err_console.print(
-            f"'{URL_KEY}' is not set. Run: "
-            f"arc settings set {URL_KEY} redis://host:6379/0 --secret"
+            f"'{URL_KEY}' is not set. Run: arc settings set {URL_KEY} redis://host:6379/0 --secret"
         )
         raise typer.Exit(code=1)
     return url
@@ -59,8 +58,7 @@ def status() -> None:
         info = client.info("server")
     except Exception as exc:
         err_console.print(
-            f"redix: FAILED to connect to "
-            f"{parsed.hostname}:{parsed.port or 6379} — {exc}"
+            f"redix: FAILED to connect to {parsed.hostname}:{parsed.port or 6379} — {exc}"
         )
         raise typer.Exit(code=1)
     finally:
@@ -86,9 +84,12 @@ def connect() -> None:
     db_number = parsed.path.lstrip("/") or "0"
     argv = [
         "redis-cli",
-        "-h", parsed.hostname or "localhost",
-        "-p", str(parsed.port or 6379),
-        "-n", db_number,
+        "-h",
+        parsed.hostname or "localhost",
+        "-p",
+        str(parsed.port or 6379),
+        "-n",
+        db_number,
     ]
 
     env = os.environ.copy()
