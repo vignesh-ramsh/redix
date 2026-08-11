@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import time
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import redis as redis_sync  # sync client — simplest for a one-shot CLI ping
 import typer
@@ -43,6 +43,67 @@ def _url() -> str:
         )
         raise typer.Exit(code=1)
     return url
+
+
+@app.command()
+def setup() -> None:
+    """Interactively configure the Redis/Valkey connection (host/port/db
+    index/user/password), validating connectivity before saving — the
+    guided alternative to hand-composing a URL for `arc settings set
+    redix_url ... --secret`. Safe to re-run: asks before overwriting an
+    existing redix_url, showing what it would replace. User and password
+    are both optional — most local/dev Redis instances have neither."""
+    root = find_project_root()
+    if root is None:
+        err_console.print(
+            "Not inside an ARC project (no .arc/arc.toml found here or in any parent)."
+        )
+        raise typer.Exit(code=1)
+
+    mgr = SettingsManager(root / ".arc")
+    existing = mgr.get(URL_KEY, reveal=True)
+    if existing is not None:
+        parsed_existing = urlparse(existing)
+        console.print(
+            f"[yellow]redix_url is already set[/yellow] "
+            f"({parsed_existing.hostname}:{parsed_existing.port or 6379})."
+        )
+        if not typer.confirm("Reconfigure it?", default=False):
+            console.print("[dim]Aborted — nothing changed.[/dim]")
+            raise typer.Exit(code=1)
+
+    host = typer.prompt("Host", default="localhost")
+    port = typer.prompt("Port", default=6379, type=int)
+    db_index = typer.prompt("DB index", default=0, type=int)
+    user = typer.prompt("User (blank for none)", default="", show_default=False)
+    password = typer.prompt("Password (blank for none)", default="", show_default=False, hide_input=True)
+
+    # quote_plus so a special character in user/password (@, :, /, ...)
+    # can't be misparsed as URL structure — same reasoning psqldb.setup
+    # applies to its DSN.
+    auth = ""
+    if user or password:
+        auth = quote_plus(user)
+        if password:
+            auth += f":{quote_plus(password)}"
+        auth += "@"
+    url = f"redis://{auth}{host}:{port}/{db_index}"
+
+    console.print(f"Connecting to {host}:{port}/{db_index}...")
+    client = redis_sync.from_url(url, socket_connect_timeout=5, socket_timeout=5)
+    try:
+        client.ping()
+        info = client.info("server")
+    except Exception as exc:
+        err_console.print(f"FAILED to connect: {exc}")
+        console.print("[dim]Nothing saved — run `arc redix setup` again to retry.[/dim]")
+        raise typer.Exit(code=1)
+    finally:
+        client.close()
+
+    mgr.set(URL_KEY, url, secret=True)
+    console.print(f"[bold green]Connected[/bold green] — redis {info.get('redis_version', '?')}")
+    console.print(f"[dim]Saved to {URL_KEY} (encrypted, .arc/arc.secrets).[/dim]")
 
 
 @app.command()
