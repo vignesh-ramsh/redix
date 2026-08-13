@@ -28,18 +28,36 @@ from redis.exceptions import LockError
 
 CAPABILITY = "redix"
 URL_KEY = "redix_url"
+SOCKET_TIMEOUT_MS_KEY = "redix_socket_timeout_ms"
 
 _logger = logging.getLogger("redix")
 
 
 class RedixProvider:
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, socket_timeout_ms: int = 5_000) -> None:
         self.url = url
+        # 0 disables it (redis-py's own default: no timeout, wait
+        # indefinitely). A real gap found by this project's own failure-
+        # mode audit: redis.from_url() with no timeout means a Redis that
+        # goes silently unresponsive (not a clean connection-refused —
+        # a network partition, an overloaded server that stops replying,
+        # a black-holed connection) hangs a read/write for as long as the
+        # OS's own TCP-level timeout, which on Linux is commonly measured
+        # in MINUTES — a request-handling path that expects a cache
+        # lookup to cost single-digit milliseconds, and that already
+        # catches Exception to degrade gracefully to the DB (see authn's
+        # own _cache_get_session/_cache_set_session), was never actually
+        # protected against THIS failure mode: `except Exception` can't
+        # catch a call that hasn't raised yet because it's still blocked.
+        self.socket_timeout_ms = socket_timeout_ms
         self._client: redis.Redis | None = None
 
     async def open(self) -> None:
         if self._client is None:
-            self._client = redis.from_url(self.url)
+            timeout = self.socket_timeout_ms / 1000 if self.socket_timeout_ms > 0 else None
+            self._client = redis.from_url(
+                self.url, socket_timeout=timeout, socket_connect_timeout=timeout
+            )
 
     async def close(self) -> None:
         if self._client is not None:
@@ -229,6 +247,15 @@ class _RenewingLock:
 
 def register(kernel: Any) -> None:
     kernel.settings.declare(URL_KEY, secret=True)
+    kernel.settings.declare(
+        SOCKET_TIMEOUT_MS_KEY,
+        type=int,
+        default=5_000,
+        doc="Socket read/write and connect timeout for every Redis operation, in "
+        "milliseconds — bounds how long a call can block if Redis becomes "
+        "unresponsive (not just cleanly unreachable) before raising instead of "
+        "hanging. 0 disables it (redis-py's own default: wait indefinitely).",
+    )
 
     url = kernel.settings.get(URL_KEY, reveal=True)
     if url is None:
@@ -236,5 +263,6 @@ def register(kernel: Any) -> None:
             f"'{URL_KEY}' is not set. Run: arc settings set {URL_KEY} redis://host:6379/0 --secret"
         )
 
-    provider = RedixProvider(url)
+    socket_timeout_ms = kernel.settings.get(SOCKET_TIMEOUT_MS_KEY)
+    provider = RedixProvider(url, socket_timeout_ms=socket_timeout_ms)
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=[])
