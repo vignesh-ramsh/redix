@@ -1,7 +1,20 @@
 """
-redix — ARC provider plugin: Redis/Valkey — cache, distributed locks,
-pub/sub, and rate-limit counters ("one dependency, four jobs" per the
-Architecture tech-stack table).
+redix — ARC provider plugin: cache, distributed locks, pub/sub, and
+rate-limit counters ("one dependency, four jobs" per the Architecture
+tech-stack table).
+
+Backend: any server speaking the Redis wire protocol (RESP2/RESP3) — a real
+Redis, or Valkey (the BSD-licensed, wire-compatible fork). redix talks to
+it entirely through `redis-py` (the `redis` package on PyPI), which is
+just a RESP client and doesn't care which of the two is on the other end
+of the socket; nothing in this file, or in `redix_url`'s value, picks one
+over the other — point it at whichever server you're actually running.
+Every mention of "Redis" below describing a general backend behavior
+(timeouts, failover, instance topology) applies identically to Valkey; the
+Lua/EVAL script further down calls the `redis.call(...)` Lua API
+specifically because that's the literal function name both Redis' and
+Valkey's own Lua interpreters expose — not a reference to which server
+you're running.
 
 Exports `arc.redix`. Nothing hard-requires it — not every ARC project wants
 caching/locks/pubsub/rate-limiting, so it stays a plain standalone plugin
@@ -38,17 +51,19 @@ class RedixProvider:
         self.url = url
         # 0 disables it (redis-py's own default: no timeout, wait
         # indefinitely). A real gap found by this project's own failure-
-        # mode audit: redis.from_url() with no timeout means a Redis that
-        # goes silently unresponsive (not a clean connection-refused —
-        # a network partition, an overloaded server that stops replying,
-        # a black-holed connection) hangs a read/write for as long as the
-        # OS's own TCP-level timeout, which on Linux is commonly measured
-        # in MINUTES — a request-handling path that expects a cache
-        # lookup to cost single-digit milliseconds, and that already
-        # catches Exception to degrade gracefully to the DB (see authn's
-        # own _cache_get_session/_cache_set_session), was never actually
-        # protected against THIS failure mode: `except Exception` can't
-        # catch a call that hasn't raised yet because it's still blocked.
+        # mode audit: redis.from_url() with no timeout means a server
+        # (Redis or Valkey — the timeout is a socket-level setting, it
+        # applies identically to either) that goes silently unresponsive
+        # (not a clean connection-refused — a network partition, an
+        # overloaded server that stops replying, a black-holed connection)
+        # hangs a read/write for as long as the OS's own TCP-level timeout,
+        # which on Linux is commonly measured in MINUTES — a request-
+        # handling path that expects a cache lookup to cost single-digit
+        # milliseconds, and that already catches Exception to degrade
+        # gracefully to the DB (see authn's own _cache_get_session/
+        # _cache_set_session), was never actually protected against THIS
+        # failure mode: `except Exception` can't catch a call that hasn't
+        # raised yet because it's still blocked.
         self.socket_timeout_ms = socket_timeout_ms
         self._client: redis.Redis | None = None
 
@@ -99,11 +114,15 @@ class RedixProvider:
         scheduler pause between acquiring and your first write can still
         let the TTL lapse before the first renewal even runs).
 
-        Single Redis instance/primary only — this is a SET NX PX lock plus
-        a best-effort background heartbeat, not Redlock's multi-node
-        quorum. Good enough for "only one of my N workers does this job
-        right now"; not a substitute for a real consensus system if you
-        need correctness under a Redis primary failover.
+        Single Redis/Valkey instance/primary only — this is a SET NX PX
+        lock plus a best-effort background heartbeat, not Redlock's
+        multi-node quorum (Redlock the algorithm, coined against Redis
+        originally, applies identically to a Valkey deployment — it's
+        about running multiple independent instances of ANY server
+        speaking this protocol, not a Redis-specific mechanism). Good
+        enough for "only one of my N workers does this job right now";
+        not a substitute for a real consensus system if you need
+        correctness under a primary failover.
         """
         return _RenewingLock(
             self._client_or_raise(), name, timeout=timeout, renew_interval=renew_interval
@@ -246,13 +265,20 @@ class _RenewingLock:
 
 
 def register(kernel: Any) -> None:
-    kernel.settings.declare(URL_KEY, secret=True)
+    kernel.settings.declare(
+        URL_KEY,
+        secret=True,
+        doc="Connection URL for redix's backing store — any server speaking the "
+        "Redis wire protocol works: a real Redis, or Valkey (the wire-compatible, "
+        "BSD-licensed fork). Still a redis://host:port/db URL either way — "
+        "redis-py (the client library) doesn't distinguish the two.",
+    )
     kernel.settings.declare(
         SOCKET_TIMEOUT_MS_KEY,
         type=int,
         default=5_000,
-        doc="Socket read/write and connect timeout for every Redis operation, in "
-        "milliseconds — bounds how long a call can block if Redis becomes "
+        doc="Socket read/write and connect timeout for every Redis/Valkey operation, "
+        "in milliseconds — bounds how long a call can block if the server becomes "
         "unresponsive (not just cleanly unreachable) before raising instead of "
         "hanging. 0 disables it (redis-py's own default: wait indefinitely).",
     )
@@ -260,7 +286,8 @@ def register(kernel: Any) -> None:
     url = kernel.settings.get(URL_KEY, reveal=True)
     if url is None:
         raise RuntimeError(
-            f"'{URL_KEY}' is not set. Run: arc settings set {URL_KEY} redis://host:6379/0 --secret"
+            f"'{URL_KEY}' is not set. Run: arc settings set {URL_KEY} redis://host:6379/0 "
+            f"--secret (works for a Redis or a Valkey server — same redis:// URL either way)"
         )
 
     socket_timeout_ms = kernel.settings.get(SOCKET_TIMEOUT_MS_KEY)

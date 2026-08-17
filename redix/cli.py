@@ -27,6 +27,19 @@ console = Console()
 err_console = Console(stderr=True, style="bold red")
 
 
+def _server_label(info: dict) -> str:
+    """"redis 6.0.16" or "valkey 8.1.9" — Valkey's own `INFO server`
+    output carries a `server_name: valkey` field real Redis never sends
+    (checked directly against both), which is what actually distinguishes
+    them; `redis_version` alone isn't reliable evidence either way — Valkey
+    keeps reporting it pinned at its Redis fork point (7.2.4) for tools
+    that only know to look for that key, alongside its own real
+    `valkey_version`."""
+    if info.get("server_name") == "valkey":
+        return f"valkey {info.get('valkey_version', '?')}"
+    return f"redis {info.get('redis_version', '?')}"
+
+
 def _url() -> str:
     root = find_project_root()
     if root is None:
@@ -52,7 +65,7 @@ def setup() -> None:
     guided alternative to hand-composing a URL for `arc settings set
     redix_url ... --secret`. Safe to re-run: asks before overwriting an
     existing redix_url, showing what it would replace. User and password
-    are both optional — most local/dev Redis instances have neither."""
+    are both optional — most local/dev Redis/Valkey instances have neither."""
     root = find_project_root()
     if root is None:
         err_console.print(
@@ -102,7 +115,7 @@ def setup() -> None:
         client.close()
 
     mgr.set(URL_KEY, url, secret=True)
-    console.print(f"[bold green]Connected[/bold green] — redis {info.get('redis_version', '?')}")
+    console.print(f"[bold green]Connected[/bold green] — {_server_label(info)}")
     console.print(f"[dim]Saved to {URL_KEY} (encrypted, .arc/arc.secrets).[/dim]")
 
 
@@ -127,24 +140,38 @@ def status() -> None:
 
     console.print(f"[bold green]redix: OK[/bold green] ({elapsed * 1000:.0f}ms)")
     console.print(f"  host:   {parsed.hostname}:{parsed.port or 6379}")
-    console.print(f"  server: redis {info.get('redis_version', '?')}")
+    console.print(f"  server: {_server_label(info)}")
 
 
 @app.command()
 def connect() -> None:
-    """Drop into an interactive redis-cli shell against the configured instance."""
+    """Drop into an interactive redis-cli/valkey-cli shell against the
+    configured instance."""
     url = _url()
-    if shutil.which("redis-cli") is None:
+    # Either CLI speaks RESP and works against either server — `redis-cli`
+    # against Valkey, `valkey-cli` against Redis, both fine. Prefer whichever
+    # is actually on PATH rather than assuming a specific one is installed;
+    # an environment that only installed Valkey's own packaging commonly has
+    # `valkey-cli` and not `redis-cli` at all.
+    if shutil.which("redis-cli") is not None:
+        cli_bin = "redis-cli"
+    elif shutil.which("valkey-cli") is not None:
+        cli_bin = "valkey-cli"
+    else:
+        cli_bin = None
+    if cli_bin is None:
         err_console.print(
-            "`redis-cli` was not found on PATH. Install the Redis client "
-            "(e.g. `apt-get install redis-tools`) and try again."
+            "Neither `redis-cli` nor `valkey-cli` was found on PATH. Install "
+            "one (e.g. `apt-get install redis-tools`, or Valkey's own CLI "
+            "package) and try again — either works against a Redis or a "
+            "Valkey server."
         )
         raise typer.Exit(code=1)
 
     parsed = urlparse(url)
     db_number = parsed.path.lstrip("/") or "0"
     argv = [
-        "redis-cli",
+        cli_bin,
         "-h",
         parsed.hostname or "localhost",
         "-p",
@@ -156,8 +183,9 @@ def connect() -> None:
     env = os.environ.copy()
     if parsed.password:
         # REDISCLI_AUTH, not `-u redis://:pw@host` — the URL form would put
-        # the password in argv, visible to every other user via `ps`.
+        # the password in argv, visible to every other user via `ps`. Also
+        # respected by valkey-cli, which kept the same env var name.
         env["REDISCLI_AUTH"] = parsed.password
 
     console.print(f"[dim]$ {' '.join(argv)}[/dim]")
-    os.execvpe("redis-cli", argv, env)
+    os.execvpe(cli_bin, argv, env)
