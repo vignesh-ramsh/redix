@@ -66,6 +66,10 @@ class RedixProvider:
         # raised yet because it's still blocked.
         self.socket_timeout_ms = socket_timeout_ms
         self._client: redis.Redis | None = None
+        # Registered once in open(), below — see rate_limit()'s own
+        # docstring for why (EVALSHA instead of sending the full Lua
+        # source on every call, on the hottest path in the system).
+        self._rate_limit_script: Any | None = None
 
     async def open(self) -> None:
         if self._client is None:
@@ -73,11 +77,13 @@ class RedixProvider:
             self._client = redis.from_url(
                 self.url, socket_timeout=timeout, socket_connect_timeout=timeout
             )
+            self._rate_limit_script = self._client.register_script(self._RATE_LIMIT_LUA)
 
     async def close(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+            self._rate_limit_script = None
 
     def _client_or_raise(self) -> redis.Redis:
         if self._client is None:
@@ -205,10 +211,22 @@ class RedixProvider:
     """
 
     async def rate_limit(self, key: str, limit: int, window_seconds: int) -> bool:
-        """Returns True if this call is within the limit for the window."""
+        """Returns True if this call is within the limit for the window.
+
+        This is the hottest path in the whole system — every request that
+        reaches rate_limit_middleware, plus authn's own login/forgot-
+        password rate limits, calls this. `eval()` used to send the FULL
+        Lua source over the wire on every single call; register_script()
+        (open(), below) uploads it to the server exactly ONCE and hands
+        back an AsyncScript that calls EVALSHA (just the script's hash)
+        from here on — redis-py's own AsyncScript.__call__ already
+        catches NoScriptError and transparently reloads-then-retries via
+        EVALSHA if the server's script cache was ever flushed (a `SCRIPT
+        FLUSH`, or a failover to a replica that never got it), so this
+        gets the EVAL fallback for free without reimplementing it."""
         client = self._client_or_raise()
         counter_key = f"ratelimit:{key}"
-        current = await client.eval(self._RATE_LIMIT_LUA, 1, counter_key, window_seconds)
+        current = await self._rate_limit_script(keys=[counter_key], args=[window_seconds], client=client)
         return int(current) <= limit
 
     async def health(self) -> dict:
