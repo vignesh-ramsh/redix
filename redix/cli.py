@@ -1,7 +1,7 @@
 """
 redix.cli — `arc redix ...` commands.
 
-Mirrors psqldb.cli exactly: mounted via the `arc.plugins.cli` entry point,
+Mirrors pgdb.cli exactly: mounted via the `arc.plugins.cli` entry point,
 independent of arc.boot(), reads the URL straight off disk via
 SettingsManager.
 """
@@ -92,7 +92,7 @@ def setup() -> None:
     password = typer.prompt("Password (blank for none)", default="", show_default=False, hide_input=True)
 
     # quote_plus so a special character in user/password (@, :, /, ...)
-    # can't be misparsed as URL structure — same reasoning psqldb.setup
+    # can't be misparsed as URL structure — same reasoning pgdb.setup
     # applies to its DSN.
     auth = ""
     if user or password:

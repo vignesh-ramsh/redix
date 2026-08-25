@@ -24,7 +24,7 @@ is Postgres-backed and works identically without it — redix stays an
 `optional_requires` there too, never a hard dependency. redix's own
 manifest never changes based on what any other plugin decides.
 
-Same lifecycle note as psqldb: register() only constructs the provider;
+Same lifecycle note as pgdb: register() only constructs the provider;
 `await arc.redix.open()` / `await arc.redix.close()` are the application's
 job at startup/shutdown until a real lifecycle hook design exists.
 """
@@ -120,7 +120,7 @@ class RedixProvider:
         back a fencing token: an integer that only ever goes up, once per
         successful acquire of THIS name, forever (Kleppmann's "How to do
         distributed locking" — the fencing-tokens pattern). Pass it to
-        whatever you're protecting (a write to psqldb, a call to some other
+        whatever you're protecting (a write to pgdb, a call to some other
         service) so that side can reject any write carrying a token lower
         than the highest one it has already seen — the one thing renewal
         can reduce the odds of but can never fully rule out (a long GC/
