@@ -213,6 +213,18 @@ class RedixProvider:
     async def rate_limit(self, key: str, limit: int, window_seconds: int) -> bool:
         """Returns True if this call is within the limit for the window.
 
+        FIXED window, not sliding: the counter resets wholesale when the
+        window expires rather than ageing out individual hits. The
+        consequence worth knowing is that a caller can spend its full
+        budget at the very end of one window and again at the start of the
+        next, so the true short-term ceiling is up to 2x `limit` across a
+        window boundary. That's the standard trade-off for a
+        one-round-trip counter (a sliding window needs a sorted set and
+        more round trips), and it's fine for the volume-bounding job this
+        does — but callers sizing a limit against a hard guarantee should
+        size for 2x, and anything needing a real guarantee (account
+        lockout) shouldn't be built on this at all.
+
         This is the hottest path in the whole system — every request that
         reaches rate_limit_middleware, plus authn's own login/forgot-
         password rate limits, calls this. `eval()` used to send the FULL
