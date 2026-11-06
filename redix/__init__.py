@@ -33,11 +33,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import logging
-from typing import Any
+import time
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 import redis.asyncio as redis
-from redis.exceptions import LockError
+from redis.exceptions import LockError, RedisError
+
+T = TypeVar("T")
 
 CAPABILITY = "redix"
 URL_KEY = "redix_url"
@@ -249,12 +254,39 @@ class RedixProvider:
             return {"ok": False, "error": str(exc)}
 
 
+class LockStatus(str, enum.Enum):
+    """What a holder can know about its lock. Only HELD means "this process is the holder".
+
+    HELD       the last renewal succeeded and its lease has not run out.
+    UNCERTAIN  a renewal failed with an error (Redis unreachable, a timeout). The key may well still
+               be ours — its lease runs until the last successful renewal's expiry — but this
+               process cannot confirm it. Renewal is retried; success makes it HELD again.
+    LOST       final. Redis says the key is no longer ours (it expired and was taken, or deleted), or
+               renewal failed until the lease ran out, after which another process may hold it.
+    """
+
+    HELD = "held"
+    UNCERTAIN = "uncertain"
+    LOST = "lost"
+
+
+class LockLostError(LockError):
+    """The holder can no longer rely on its lock: it is UNCERTAIN or LOST. Raised by
+    `ensure_held()` and `run_while_held()`. A LockError, so code that already handles a lock
+    that could not be acquired keeps working."""
+
+
 class _RenewingLock:
     """`async with` wrapper around a redis-py Lock: acquires it, hands back
     a fencing token, keeps the TTL alive with a background heartbeat for as
     long as the `async with` block runs, and always cancels the heartbeat
     and releases on exit — even if the block raised. See
     RedixProvider.lock()'s own docstring for the full design rationale.
+
+    The heartbeat also watches the lock. A renewal can fail, and then the holder may no longer
+    be the only one inside its critical section; `status`, `at_risk`, `ensure_held()` and
+    `run_while_held()` let the holder find out instead of carrying on as if nothing happened
+    (the heartbeat used to die silently on any error but LockError).
     """
 
     #: How long a lock name's own fencing counter key is kept alive PAST
@@ -267,6 +299,11 @@ class _RenewingLock:
     #: ever saved, forever, under the old permanently-TTL-less shape)
     #: eventually gets reclaimed by Redis instead of leaking permanently.
     _FENCING_COUNTER_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+    #: Pause between attempts to take a lock someone else holds (redis-py's own default).
+    _ACQUIRE_POLL_SECONDS = 0.1
+    #: While renewal is failing, retry at least this often rather than once per renew_interval:
+    #: the lease is running out and a retry that lands in time makes the lock HELD again.
+    _RETRY_WHILE_UNCERTAIN_SECONDS = 1.0
 
     def __init__(
         self,
@@ -289,6 +326,107 @@ class _RenewingLock:
         self._client = client
         self._renew_task: asyncio.Task[None] | None = None
         self.fencing_token: int | None = None
+        self._status: LockStatus | None = None  # None: not acquired (yet, or any more)
+        self._reason = ""
+        #: When this process can no longer be SURE it holds the key: the moment the last
+        #: successful renewal (or the acquisition) was SENT plus the lease. Redis starts the lease
+        #: when it processes the request, which is no earlier than when it was sent, so the key
+        #: cannot expire before this.
+        self._sure_until = 0.0
+        #: Set whenever the lock is not (confirmed) HELD — UNCERTAIN or LOST. Cleared again if an
+        #: UNCERTAIN lock is renewed in time; never cleared once LOST.
+        self.at_risk = asyncio.Event()
+
+    # ---- what the holder can ask --------------------------------------- #
+    @property
+    def status(self) -> LockStatus | None:
+        """HELD / UNCERTAIN / LOST, or None before acquisition and after release. Also notices
+        a lease that ran out while the event loop was too busy for the heartbeat to run."""
+        if self._status in (LockStatus.HELD, LockStatus.UNCERTAIN) and time.monotonic() >= self._sure_until:
+            self._set_status(LockStatus.LOST, "its lease ran out without a successful renewal")
+        return self._status
+
+    @property
+    def is_held(self) -> bool:
+        return self.status is LockStatus.HELD
+
+    def ensure_held(self) -> None:
+        """Raise LockLostError unless the lock is confirmed held. Call it before a side effect that
+        must not happen twice (a fencing token protects the resource; this protects the work)."""
+        status = self.status
+        if status is not LockStatus.HELD:
+            raise LockLostError(
+                f"redix lock {self._name!r} is "
+                f"{status.value if status else 'not held'}"
+                + (f": {self._reason}" if self._reason else "")
+            )
+
+    async def run_while_held(self, run: Callable[[], Awaitable[T]]) -> T:
+        """Run `run()` for as long as the lock is confirmed held. The moment it is not — a
+        renewal failed, so leadership is UNCERTAIN or LOST — `run()` is cancelled and
+        LockLostError is raised: stand down first, find out later. Whatever `run()` returns
+        or raises is passed through otherwise.
+
+        Cancelled `run()` leaves what it already started behind (a task it spawned, a request it
+        sent); it only stops doing anything NEW."""
+        self.ensure_held()
+        work = asyncio.ensure_future(run())
+        risk = asyncio.ensure_future(self.at_risk.wait())
+        try:
+            await asyncio.wait({work, risk}, return_when=asyncio.FIRST_COMPLETED)
+            if work.done():
+                return work.result()
+            raise LockLostError(
+                f"redix lock {self._name!r} is {self._status.value if self._status else 'not held'}"
+                + (f": {self._reason}" if self._reason else "")
+                + " — stopped what it protected"
+            )
+        finally:
+            # whichever did not finish: the work when the lock was lost (or we were cancelled), the
+            # wait on at_risk when the work finished first
+            for task in (work, risk):
+                task.cancel()
+            await asyncio.gather(work, risk, return_exceptions=True)
+
+    # ---- state changes -------------------------------------------------- #
+    def _set_status(self, new: LockStatus, reason: str = "") -> None:
+        old = self._status
+        if old is LockStatus.LOST or old is new:
+            return  # LOST is final
+        self._status = new
+        self._reason = reason if new is not LockStatus.HELD else ""
+        if new is LockStatus.HELD:
+            self.at_risk.clear()
+            if old is LockStatus.UNCERTAIN:
+                _logger.info("redix lock '%s': renewal succeeded again — held", self._name)
+            return
+        self.at_risk.set()
+        if new is LockStatus.UNCERTAIN:
+            _logger.warning(
+                "redix lock '%s': renewal failed (%s) — whether this process still holds it is "
+                "UNCERTAIN; retrying until its lease runs out in about %.1fs",
+                self._name, reason, max(0.0, self._sure_until - time.monotonic()),
+            )
+        else:
+            _logger.warning(
+                "redix lock '%s': LOST (%s) — the critical section is no longer protected; "
+                "relying on its fencing token to reject any now-stale writes.",
+                self._name, reason,
+            )
+
+    async def _acquire(self) -> float | None:
+        """Take the lock, waiting up to `blocking_timeout` (None: forever). Returns when the
+        SUCCESSFUL attempt was sent (monotonic seconds) — the start of the lease — or None if
+        it could not be taken in time. The same polling redis-py's blocking acquire does, done
+        here so that the start of the lease is known exactly."""
+        give_up_at = None if self._blocking_timeout is None else time.monotonic() + self._blocking_timeout
+        while True:
+            attempt_sent = time.monotonic()
+            if await self._lock.acquire(blocking=False):
+                return attempt_sent
+            if give_up_at is not None and time.monotonic() + self._ACQUIRE_POLL_SECONDS > give_up_at:
+                return None
+            await asyncio.sleep(self._ACQUIRE_POLL_SECONDS)
 
     async def __aenter__(self) -> int:
         # Bounded, never indefinite by default — redis-py's own
@@ -296,13 +434,16 @@ class _RenewingLock:
         # which turns one slow/dead holder into an unbounded pile-up of
         # every other caller waiting on this exact name. See
         # RedixProvider.lock()'s own docstring for why "forever" was
-        # never a bound anyone actually chose.
-        acquired = await self._lock.acquire(blocking_timeout=self._blocking_timeout)
-        if not acquired:
+        # never a bound anyone actually chose on purpose.
+        attempt_sent = await self._acquire()
+        if attempt_sent is None:
             raise LockError(
                 f"could not acquire redix lock {self._name!r} within "
                 f"{self._blocking_timeout}s"
             )
+        self._sure_until = attempt_sent + self._timeout
+        self._reason = ""
+        self._status = LockStatus.HELD
         # A counter key with a long, refreshed-on-every-acquire TTL (not
         # permanently TTL-less) — the sequence keeps climbing across every
         # ACTIVELY-used acquire of this same name, which is the only thing
@@ -321,34 +462,68 @@ class _RenewingLock:
         return self.fencing_token
 
     async def _renew_loop(self) -> None:
+        """Keep the lease alive, and keep `status` true. Every way a renewal can go wrong is
+        recorded; none of them ends this loop silently (it used to die on anything but LockError,
+        leaving the holder believing it held a lock that was about to expire)."""
         try:
             while True:
-                await asyncio.sleep(self._renew_interval)
+                await asyncio.sleep(self._delay_until_next_attempt())
+                if self._status is LockStatus.LOST:
+                    return  # declared lost (even lazily, by `status`): stop keeping a lease we disowned alive
+                sent = time.monotonic()
                 try:
-                    await self._lock.extend(self._timeout, replace_ttl=True)
-                except LockError:
-                    # We no longer hold it — someone else's TTL is running
-                    # now. Nothing to do here: the fencing token already
-                    # handed to the caller is exactly what protects
-                    # whatever they're doing from this moment on, not this
-                    # loop. Stop trying rather than spin forever.
-                    _logger.warning(
-                        "redix lock '%s': lost during renewal — the critical "
-                        "section is no longer protected; relying on its "
-                        "fencing token to reject any now-stale writes.",
-                        self._name,
+                    # Never wait past the moment the lease can run out: a hung Redis must turn
+                    # into "lost" on time, not whenever the socket gives up.
+                    await asyncio.wait_for(
+                        self._lock.extend(self._timeout, replace_ttl=True),
+                        timeout=max(0.001, self._sure_until - sent),
                     )
+                except LockError:
+                    # Redis answered and the key is not ours: it expired and someone else may
+                    # hold it now. Final.
+                    self._set_status(LockStatus.LOST, "Redis says this process no longer holds it")
                     return
+                except (RedisError, OSError, asyncio.TimeoutError) as exc:
+                    # Could not find out. The lease is still running until `_sure_until`.
+                    if time.monotonic() >= self._sure_until:
+                        self._set_status(
+                            LockStatus.LOST,
+                            f"renewal kept failing until the lease ran out ({type(exc).__name__}: {exc})",
+                        )
+                        return
+                    self._set_status(LockStatus.UNCERTAIN, f"{type(exc).__name__}: {exc}")
+                else:
+                    self._sure_until = sent + self._timeout
+                    self._set_status(LockStatus.HELD)
         except asyncio.CancelledError:
             pass
+
+    def _delay_until_next_attempt(self) -> float:
+        if self._status is LockStatus.UNCERTAIN:
+            return min(
+                self._renew_interval,
+                self._RETRY_WHILE_UNCERTAIN_SECONDS,
+                max(0.0, self._sure_until - time.monotonic()),
+            )
+        return self._renew_interval
 
     async def __aexit__(self, *exc_info: object) -> None:
         if self._renew_task is not None:
             self._renew_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._renew_task
-        with contextlib.suppress(LockError):
-            await self._lock.release()
+        try:
+            with contextlib.suppress(LockError):
+                await self._lock.release()
+        except (RedisError, OSError, asyncio.TimeoutError) as exc:
+            # The work is done (or has already failed for its own reason); a lock that cannot be
+            # released expires by itself. Raising here would replace the block's real outcome.
+            _logger.warning(
+                "redix lock '%s': could not release it (%s: %s); it expires on its own",
+                self._name, type(exc).__name__, exc,
+            )
+        finally:
+            self._status = None
 
 
 def register(kernel: Any) -> None:
