@@ -40,6 +40,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
 import redis.asyncio as redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import LockError, RedisError
 
 T = TypeVar("T")
@@ -47,13 +48,57 @@ T = TypeVar("T")
 CAPABILITY = "redix"
 URL_KEY = "redix_url"
 SOCKET_TIMEOUT_MS_KEY = "redix_socket_timeout_ms"
+MAX_CONNECTIONS_KEY = "redix_max_connections"
+POOL_WAIT_MS_KEY = "redix_pool_wait_ms"
+
+#: Connections one process may hold open to the server. redis-py's own default is 100 and, when all
+#: are in use, its stock pool raises "Too many connections" at once - which a gateway worker with
+#: ~100 requests in flight reached (each request makes one or more calls). Connections are opened
+#: on demand, so a large ceiling costs nothing until a process is that busy; keep
+#: (processes) x (this) under the server's `maxclients` (10000 by default).
+DEFAULT_MAX_CONNECTIONS = 512
+#: How long a call waits for a free connection when all are in use, before it fails like any other
+#: Redis error (callers already degrade on that: the rate limiter to its in-process counter, the
+#: session cache to the database). 0 = fail at once.
+DEFAULT_POOL_WAIT_MS = 1_000
 
 _logger = logging.getLogger("redix")
 
 
+class _CountingPool(redis.BlockingConnectionPool):
+    """redis-py's blocking pool (a caller waits for a free connection) that also counts the waits
+    that ran out - the signal that the pool is too small for the load, as opposed to any other
+    connection failure (a server that is down fails with a different error, no timeout behind it)."""
+
+    wait_timeouts = 0
+
+    async def get_connection(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await super().get_connection(*args, **kwargs)
+        except RedisConnectionError as exc:
+            if isinstance(exc.__cause__, asyncio.TimeoutError):
+                self.wait_timeouts += 1
+            raise
+
+
 class RedixProvider:
-    def __init__(self, url: str, socket_timeout_ms: int = 5_000) -> None:
+    def __init__(
+        self,
+        url: str,
+        socket_timeout_ms: int = 5_000,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        pool_wait_ms: int = DEFAULT_POOL_WAIT_MS,
+    ) -> None:
+        if max_connections < 1:
+            raise ValueError(f"max_connections must be at least 1, got {max_connections}")
+        if pool_wait_ms < 0:
+            raise ValueError(f"pool_wait_ms cannot be negative, got {pool_wait_ms}")
         self.url = url
+        self.max_connections = max_connections
+        self.pool_wait_ms = pool_wait_ms
+        self._pool: _CountingPool | None = None
+        #: kept on the provider, not the pool, so close() + open() does not reset the count
+        self._wait_timeouts_before_reopen = 0
         # 0 disables it (redis-py's own default: no timeout, wait
         # indefinitely). A real gap found by this project's own failure-
         # mode audit: redis.from_url() with no timeout means a server
@@ -79,16 +124,36 @@ class RedixProvider:
     async def open(self) -> None:
         if self._client is None:
             timeout = self.socket_timeout_ms / 1000 if self.socket_timeout_ms > 0 else None
-            self._client = redis.from_url(
-                self.url, socket_timeout=timeout, socket_connect_timeout=timeout
+            self._pool = _CountingPool.from_url(
+                self.url,
+                max_connections=self.max_connections,
+                timeout=self.pool_wait_ms / 1000,
+                socket_timeout=timeout,
+                socket_connect_timeout=timeout,
             )
+            self._client = redis.Redis(connection_pool=self._pool)
             self._rate_limit_script = self._client.register_script(self._RATE_LIMIT_LUA)
 
     async def close(self) -> None:
         if self._client is not None:
-            await self._client.aclose()
+            self._wait_timeouts_before_reopen += self._pool.wait_timeouts if self._pool is not None else 0
+            # the pool was built here, not by the client, so the client will not close it on its own
+            await self._client.aclose(close_connection_pool=True)
             self._client = None
+            self._pool = None
             self._rate_limit_script = None
+
+    def metrics(self) -> dict[str, int]:
+        """arc.metrics.collect()'s hook: this process's pool, for /metrics. `pool_wait_timeouts_total`
+        above zero means calls ran out of patience waiting for a connection - raise
+        redix_max_connections (or look for a call that holds one for long)."""
+        pool = self._pool
+        in_use = len(getattr(pool, "_in_use_connections", ())) if pool is not None else 0
+        return {
+            "pool_max_connections": self.max_connections,
+            "pool_connections_in_use": in_use,
+            "pool_wait_timeouts_total": self._wait_timeouts_before_reopen + (pool.wait_timeouts if pool is not None else 0),
+        }
 
     def _client_or_raise(self) -> redis.Redis:
         if self._client is None:
@@ -544,6 +609,24 @@ def register(kernel: Any) -> None:
         "unresponsive (not just cleanly unreachable) before raising instead of "
         "hanging. 0 disables it (redis-py's own default: wait indefinitely).",
     )
+    kernel.settings.declare(
+        MAX_CONNECTIONS_KEY,
+        type=int,
+        default=DEFAULT_MAX_CONNECTIONS,
+        doc="Most connections each process (gateway worker, queue worker, scheduler) opens to "
+        "Redis/Valkey, at least 1. They are opened on demand. A busy gateway worker needs about "
+        "one per request in flight; when they are all in use a call waits redix_pool_wait_ms and "
+        "then fails (the rate limiter falls back to an in-process counter, the session cache to "
+        "the database - see arc_redix_pool_wait_timeouts_total in /metrics). Keep processes x this "
+        "below the server's maxclients (10000 by default).",
+    )
+    kernel.settings.declare(
+        POOL_WAIT_MS_KEY,
+        type=int,
+        default=DEFAULT_POOL_WAIT_MS,
+        doc="How long, in milliseconds, a call waits for a free connection when all "
+        f"{MAX_CONNECTIONS_KEY} are in use before it fails. 0 = fail at once.",
+    )
 
     url = kernel.settings.get(URL_KEY, reveal=True)
     if url is None:
@@ -553,5 +636,13 @@ def register(kernel: Any) -> None:
         )
 
     socket_timeout_ms = kernel.settings.get(SOCKET_TIMEOUT_MS_KEY)
-    provider = RedixProvider(url, socket_timeout_ms=socket_timeout_ms)
+    max_connections = kernel.settings.get(MAX_CONNECTIONS_KEY)
+    pool_wait_ms = kernel.settings.get(POOL_WAIT_MS_KEY)
+    if max_connections < 1:
+        raise RuntimeError(f"'{MAX_CONNECTIONS_KEY}' must be at least 1, got {max_connections}.")
+    if pool_wait_ms < 0:
+        raise RuntimeError(f"'{POOL_WAIT_MS_KEY}' cannot be negative, got {pool_wait_ms}.")
+    provider = RedixProvider(
+        url, socket_timeout_ms=socket_timeout_ms, max_connections=max_connections, pool_wait_ms=pool_wait_ms
+    )
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=[])
