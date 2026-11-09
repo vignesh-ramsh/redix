@@ -595,37 +595,35 @@ def register(kernel: Any) -> None:
     kernel.settings.declare(
         URL_KEY,
         secret=True,
-        doc="Connection URL for redix's backing store — any server speaking the "
-        "Redis wire protocol works: a real Redis, or Valkey (the wire-compatible, "
-        "BSD-licensed fork). Still a redis://host:port/db URL either way — "
-        "redis-py (the client library) doesn't distinguish the two.",
+        doc="The address of the Redis (or Valkey) server, written like `redis://host:6379/0`, with `:password@` "
+        "after `redis://` if it needs one. It is used for the cache, locks, the request limit and sessions. "
+        "Kept as a secret because it can contain a password.",
     )
     kernel.settings.declare(
         SOCKET_TIMEOUT_MS_KEY,
         type=int,
         default=5_000,
-        doc="Socket read/write and connect timeout for every Redis/Valkey operation, "
-        "in milliseconds — bounds how long a call can block if the server becomes "
-        "unresponsive (not just cleanly unreachable) before raising instead of "
-        "hanging. 0 disables it (redis-py's own default: wait indefinitely).",
+        doc="How long, in milliseconds, ARC waits for Redis to answer or to accept a connection before giving up "
+        "with an error, so a Redis that has silently stopped answering cannot freeze requests. 0 turns the "
+        "limit off, and a stuck call can then hang for minutes.",
     )
     kernel.settings.declare(
         MAX_CONNECTIONS_KEY,
         type=int,
         default=DEFAULT_MAX_CONNECTIONS,
-        doc="Most connections each process (gateway worker, queue worker, scheduler) opens to "
-        "Redis/Valkey, at least 1. They are opened on demand. A busy gateway worker needs about "
-        "one per request in flight; when they are all in use a call waits redix_pool_wait_ms and "
-        "then fails (the rate limiter falls back to an in-process counter, the session cache to "
-        "the database - see arc_redix_pool_wait_timeouts_total in /metrics). Keep processes x this "
-        "below the server's maxclients (10000 by default).",
+        doc="The most connections each ARC process (web worker, queue worker, scheduler) opens to Redis or Valkey; "
+        "at least 1. They are opened only when needed. A busy web worker needs about one for each request in "
+        "progress. When all are in use, a call waits `redix_pool_wait_ms` and then fails (the request limit "
+        "then counts in memory, and the session cache falls back to the database); "
+        "`arc_redix_pool_wait_timeouts_total` on /metrics counts this. Keep the number of processes times this "
+        "below the server's own `maxclients` (10000 by default).",
     )
     kernel.settings.declare(
         POOL_WAIT_MS_KEY,
         type=int,
         default=DEFAULT_POOL_WAIT_MS,
-        doc="How long, in milliseconds, a call waits for a free connection when all "
-        f"{MAX_CONNECTIONS_KEY} are in use before it fails. 0 = fail at once.",
+        doc="How long, in milliseconds, a call waits for a free Redis connection when all `redix_max_connections` "
+        "are in use, before it fails. 0 means fail at once.",
     )
 
     url = kernel.settings.get(URL_KEY, reveal=True)
