@@ -18,7 +18,7 @@ import typer
 from rich.console import Console
 
 from arc.runtime import find_project_root
-from arc.settings import SettingsManager
+from arc.settings import SettingsManager, cli_actor
 
 from . import URL_KEY
 
@@ -114,7 +114,7 @@ def setup() -> None:
     finally:
         client.close()
 
-    mgr.set(URL_KEY, url, secret=True)
+    mgr.set(URL_KEY, url, secret=True, updated_by=cli_actor())
     console.print(f"[bold green]Connected[/bold green] — {_server_label(info)}")
     console.print(f"[dim]Saved to {URL_KEY} (encrypted, .arc/arc.store.db).[/dim]")
 
